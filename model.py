@@ -87,7 +87,64 @@ class BitLinear(nn.Module):
         return out
 
 
-def make_linear(in_f, out_f, bias=True, use_bitnet=False):
+class FastBitLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+        self.rms_norm = nn.RMSNorm(in_features)
+        nn.init.normal_(self.weight, std=0.02)
+
+    def _int8_forward(self, x):
+        w = self.weight.detach()
+        alpha = w.abs().mean()
+        threshold = alpha * 0.5
+        w_pos = (w > threshold).to(torch.int8)
+        w_neg = (w < -threshold).to(torch.int8)
+
+        x_max = x.detach().abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
+        x_scale = 127.0 / x_max
+        x_q = (x.detach() * x_scale).round().clamp(-128, 127).to(torch.int8)
+
+        shape = x_q.shape
+        x_2d = x_q.reshape(-1, shape[-1])
+
+        y_pos = torch._int_mm(x_2d, w_pos.T)
+        y_neg = torch._int_mm(x_2d, w_neg.T)
+        y = (y_pos - y_neg).float().reshape(*shape[:-1], self.out_features)
+        return y * (alpha / x_scale)
+
+    def _ste_forward(self, x):
+        alpha = self.weight.abs().mean()
+        threshold = alpha * 0.5
+        w_ternary = torch.zeros_like(self.weight)
+        w_ternary[self.weight > threshold] = alpha
+        w_ternary[self.weight < -threshold] = -alpha
+        w_q = self.weight + (w_ternary - self.weight).detach()
+
+        x_scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
+        x_scaled = x * x_scale
+        x_q = x_scaled + (x_scaled.round().clamp(-128, 127) - x_scaled).detach()
+        x_q = x_q / x_scale
+
+        return F.linear(x_q, w_q, None)
+
+    def forward(self, x):
+        x = self.rms_norm(x)
+        if self.training:
+            out = self._ste_forward(x)
+        else:
+            out = self._int8_forward(x)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+
+def make_linear(in_f, out_f, bias=True, use_bitnet=False, use_fast_bitnet=False):
+    if use_fast_bitnet:
+        return FastBitLinear(in_f, out_f, bias=bias)
     if use_bitnet:
         return BitLinear(in_f, out_f, bias=bias)
     return nn.Linear(in_f, out_f, bias=bias)

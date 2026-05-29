@@ -41,33 +41,26 @@ def _quantization_tag(config):
 
 
 def build_model_name(config, dataset_name="tinystories"):
-    tags = [
-        f"L{config['n_layer']}",
-        f"D{config['n_embd']}",
-        f"H{config['n_head']}",
-        f"Ctx{config['block_size']}",
-    ]
-
-    if _truthy(config, "use_rope"):
-        tags.append("RoPE")
-    if config.get("n_kv_head", config["n_head"]) != config["n_head"]:
-        tags.append(f"GQA{config['n_kv_head']}")
-    if _truthy(config, "use_swiglu"):
-        tags.append("SwiGLU")
-    if _truthy(config, "use_rmsnorm"):
-        tags.append("RMSNorm")
+    n_params = _estimate_params(config)
+    tags = []
     if _truthy(config, "use_mtp"):
-        tags.append(f"MTP{config.get('mtp_heads', 4)}")
+        tags.append("mtp")
     if _truthy(config, "use_mhc"):
-        tags.append(f"MHC{config.get('mhc_streams', 4)}")
+        tags.append("mhc")
     if _truthy(config, "use_bitnet"):
-        tags.append("BitNet")
+        tags.append("bitnet")
+    suffix = "-".join(tags)
+    if suffix:
+        return f"{dataset_name}-{n_params}-{suffix}"
+    return f"{dataset_name}-{n_params}"
 
-    quant_tag = _quantization_tag(config)
-    if quant_tag:
-        tags.append(quant_tag)
 
-    return "-".join([dataset_name, *tags])
+def _estimate_params(config):
+    n = config["vocab_size"] * config["n_embd"]
+    n += config["n_layer"] * (4 * config["n_embd"] ** 2 + 3 * config["n_embd"] * (4 * config["n_embd"]))
+    if n >= 1e9:
+        return f"{n/1e9:.0f}b"
+    return f"{n/1e6:.0f}m"
 
 
 @torch.no_grad()
