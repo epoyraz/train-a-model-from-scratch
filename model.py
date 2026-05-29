@@ -12,6 +12,30 @@ def soft_cap(logits, cap):
     return logits
 
 
+def chunked_cross_entropy(hidden, weight, targets, cap=0, chunk_size=2048):
+    """Memory-efficient cross-entropy. Projects hidden -> logits and reduces the loss
+    in token-chunks so the full [N, vocab] logits are never materialized at once (each
+    chunk's logits are recomputed in backward via checkpointing). Numerically equal to
+    F.cross_entropy(soft_cap(hidden @ weight.T), targets, ignore_index=-1)."""
+    hidden = hidden.reshape(-1, hidden.size(-1))
+    targets = targets.reshape(-1)
+    n_valid = (targets != -1).sum().clamp(min=1)
+
+    def chunk_loss(h, t, w):
+        logits = soft_cap(F.linear(h, w), cap)
+        return F.cross_entropy(logits, t, ignore_index=-1, reduction="sum")
+
+    use_ckpt = torch.is_grad_enabled() and (hidden.requires_grad or weight.requires_grad)
+    total = hidden.new_zeros(())
+    for i in range(0, hidden.size(0), chunk_size):
+        h, t = hidden[i:i + chunk_size], targets[i:i + chunk_size]
+        if use_ckpt:
+            total = total + checkpoint(chunk_loss, h, t, weight, use_reentrant=False)
+        else:
+            total = total + chunk_loss(h, t, weight)
+    return total / n_valid
+
+
 # --- mHC: Manifold-Constrained Hyper-Connections ---
 
 def sinkhorn(log_alpha, n_iters=5):
@@ -274,11 +298,24 @@ class MTPHead(nn.Module):
         n_embd = config["n_embd"]
         vocab_size = config["vocab_size"]
         self.logit_cap = config.get("logit_cap", 0)
+        self.use_chunked_loss = config.get("use_chunked_loss", False)
+        self.loss_chunk_size = config.get("loss_chunk_size", 2048)
         self.proj = nn.Linear(n_embd, n_embd)
         self.ln = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
 
     def forward(self, hidden, targets=None):
+        if targets is not None and self.use_chunked_loss:
+            shift = self.future_idx
+            if targets.size(1) <= shift:
+                return None, None
+            # Project only the positions with a future target, then reduce in chunks.
+            h = self.ln(self.proj(hidden[:, :-shift]))
+            loss = chunked_cross_entropy(
+                h, self.lm_head.weight, targets[:, shift:], self.logit_cap, self.loss_chunk_size
+            )
+            return None, loss
+
         h = self.ln(self.proj(hidden))
         logits = soft_cap(self.lm_head(h), self.logit_cap)
         loss = None
@@ -489,6 +526,8 @@ class GPT(nn.Module):
         self.turboquant_bits = config.get("turboquant_bits", 4)
         self.use_activation_checkpointing = config.get("use_activation_checkpointing", False)
         self.logit_cap = config.get("logit_cap", 0)
+        self.use_chunked_loss = config.get("use_chunked_loss", False)
+        self.loss_chunk_size = config.get("loss_chunk_size", 2048)
         use_rmsnorm = config.get("use_rmsnorm", False)
 
         self.tok_emb = nn.Embedding(config["vocab_size"], config["n_embd"])
@@ -550,15 +589,23 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None, return_hidden=False):
         hidden = self._compute_hidden(idx)
-        logits = soft_cap(self.lm_head(hidden), self.logit_cap)
         loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-            if self.use_mtp:
-                for head in self.mtp_heads:
-                    _, mtp_loss = head(hidden, targets)
-                    if mtp_loss is not None:
-                        loss = loss + self.mtp_weight * mtp_loss
+        # Chunked loss avoids materializing the full [N, vocab] logits during training.
+        # It can't return logits, so fall back to the dense path when logits are needed.
+        if targets is not None and self.use_chunked_loss and not return_hidden:
+            logits = None
+            loss = chunked_cross_entropy(
+                hidden, self.lm_head.weight, targets, self.logit_cap, self.loss_chunk_size
+            )
+        else:
+            logits = soft_cap(self.lm_head(hidden), self.logit_cap)
+            if targets is not None:
+                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        if targets is not None and self.use_mtp:
+            for head in self.mtp_heads:
+                _, mtp_loss = head(hidden, targets)
+                if mtp_loss is not None:
+                    loss = loss + self.mtp_weight * mtp_loss
         if return_hidden:
             return logits, loss, hidden
         return logits, loss

@@ -68,16 +68,29 @@ def _estimate_params(config):
 
 @torch.no_grad()
 def newton_schulz(M, steps=5):
+    # Quintic Newton-Schulz orthogonalization. Works on a single [r, c] matrix or a
+    # batched [G, r, c] stack (one orthogonalization per matrix) via batched matmul,
+    # so a whole group of same-shape weights is done in one call.
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = M / (M.norm() + 1e-7)
+    X = M / (M.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    transpose = X.size(-2) > X.size(-1)  # iterate on the smaller Gram matrix (cheaper FLOPs)
+    if transpose:
+        X = X.mT
     for _ in range(steps):
-        A = X @ X.T
+        A = X @ X.mT
         AX = A @ X  # reuse; the quintic needs A@X and A@(A@X), not A@X twice
         X = a * X + b * AX + c * (A @ AX)
+    if transpose:
+        X = X.mT
     return X
 
 
 class Muon(torch.optim.Optimizer):
+    """Muon for 2D weight matrices. Same updates as the per-matrix version, but it
+    stacks all same-shape matrices and orthogonalizes them in a single batched
+    Newton-Schulz call (modded-nanoGPT / nanochat style) — far fewer kernel launches,
+    which is what dominates on a launch-bound GPU."""
+
     def __init__(self, params, lr=3e-3, momentum=0.95, ns_steps=5):
         defaults = dict(lr=lr, momentum=momentum, ns_steps=ns_steps)
         super().__init__(params, defaults)
@@ -91,25 +104,28 @@ class Muon(torch.optim.Optimizer):
         for group in self.param_groups:
             lr = group["lr"]
             momentum = group["momentum"]
+            ns_steps = group["ns_steps"]
+            by_shape = {}
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                g = p.grad
-                if g.ndim < 2:
-                    p.add_(g, alpha=-lr)
+                if p.grad.ndim < 2:  # 1D params: plain SGD
+                    p.add_(p.grad, alpha=-lr)
                     continue
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(momentum).add_(g)
-                shape = buf.shape
-                buf_2d = buf.view(shape[0], -1) if buf.ndim > 2 else buf
-                update = newton_schulz(buf_2d, steps=group["ns_steps"])
-                if buf.ndim > 2:
-                    update = update.view(shape)
-                scale = max(1, buf_2d.shape[0] / buf_2d.shape[1]) ** 0.5
-                p.add_(update, alpha=-lr * scale)
+                by_shape.setdefault(tuple(p.grad.shape), []).append(p)
+
+            for shape, plist in by_shape.items():
+                grads = torch.stack([p.grad for p in plist])  # [G, r, c]
+                state = self.state[plist[0]]  # stable anchor for the group's buffer
+                buf = state.get("stacked_buf")
+                if buf is None or buf.shape != grads.shape:
+                    buf = torch.zeros_like(grads)
+                    state["stacked_buf"] = buf
+                buf.mul_(momentum).add_(grads)
+                updates = newton_schulz(buf, steps=ns_steps)  # [G, r, c], one call
+                scale = max(1.0, shape[-2] / shape[-1]) ** 0.5
+                for i, p in enumerate(plist):
+                    p.add_(updates[i], alpha=-lr * scale)
         return loss
 
 
@@ -147,6 +163,8 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=int(os.getenv("NUM_WORKERS", 2)))
     parser.add_argument("--compile", action="store_true", default=os.getenv("TORCH_COMPILE", "0") == "1")
     parser.add_argument("--activation-checkpointing", action="store_true")
+    parser.add_argument("--chunked-loss", action="store_true",
+                        help="memory-efficient chunked cross-entropy (avoids full [N,vocab] logits)")
     parser.add_argument("--no-trackio", action="store_true")
     return parser.parse_args()
 
@@ -301,6 +319,8 @@ def main():
     model_config = get_model_config(args.profile)
     if args.activation_checkpointing:
         model_config["use_activation_checkpointing"] = True
+    if args.chunked_loss:
+        model_config["use_chunked_loss"] = True
     block_size = model_config["block_size"]
     model_name = build_model_name(model_config)
 
