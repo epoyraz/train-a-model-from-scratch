@@ -108,8 +108,13 @@ class FastBitLinear(nn.Module):
         w = self.weight.detach()
         alpha = w.abs().mean()
         threshold = alpha * 0.5
-        w_pos = (w > threshold).to(torch.int8)
-        w_neg = (w < -threshold).to(torch.int8)
+        # Pack the ternary weight into a single signed int8 tensor {-1,0,+1} so the
+        # whole layer is ONE int8 matmul (dp4a / int8 tensor cores), not two. This is
+        # exactly equivalent to (x @ w_pos.T) - (x @ w_neg.T) but ~2x cheaper, and it
+        # beats fp16 at prefill/training scale.
+        w_ternary = torch.zeros_like(w, dtype=torch.int8)
+        w_ternary[w > threshold] = 1
+        w_ternary[w < -threshold] = -1
 
         x_max = x.detach().abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
         x_scale = 127.0 / x_max
@@ -119,16 +124,13 @@ class FastBitLinear(nn.Module):
         x_2d = x_q.reshape(-1, shape[-1])
 
         rows = x_2d.shape[0]
-        if rows <= 16:
-            pad = 17 - rows
-            x_2d = torch.nn.functional.pad(x_2d, (0, 0, 0, pad))
-            y_pos = torch._int_mm(x_2d, w_pos.T)[:rows]
-            y_neg = torch._int_mm(x_2d, w_neg.T)[:rows]
+        if rows <= 16:  # torch._int_mm requires more than 16 rows
+            x_2d = torch.nn.functional.pad(x_2d, (0, 0, 0, 17 - rows))
+            y = torch._int_mm(x_2d, w_ternary.T)[:rows]
         else:
-            y_pos = torch._int_mm(x_2d, w_pos.T)
-            y_neg = torch._int_mm(x_2d, w_neg.T)
+            y = torch._int_mm(x_2d, w_ternary.T)
 
-        y = (y_pos - y_neg).float().reshape(*shape[:-1], self.out_features)
+        y = y.float().reshape(*shape[:-1], self.out_features)
         return y * (alpha / x_scale)
 
     def _ste_forward(self, x):
