@@ -5,6 +5,13 @@ import math
 from torch.utils.checkpoint import checkpoint
 
 
+def soft_cap(logits, cap):
+    """Gemma2/modded-nanoGPT logit soft-capping: cap * tanh(logits / cap). No-op if cap falsy."""
+    if cap:
+        return cap * torch.tanh(logits / cap)
+    return logits
+
+
 # --- mHC: Manifold-Constrained Hyper-Connections ---
 
 def sinkhorn(log_alpha, n_iters=5):
@@ -264,13 +271,14 @@ class MTPHead(nn.Module):
         self.future_idx = future_idx
         n_embd = config["n_embd"]
         vocab_size = config["vocab_size"]
+        self.logit_cap = config.get("logit_cap", 0)
         self.proj = nn.Linear(n_embd, n_embd)
         self.ln = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
 
     def forward(self, hidden, targets=None):
         h = self.ln(self.proj(hidden))
-        logits = self.lm_head(h)
+        logits = soft_cap(self.lm_head(h), self.logit_cap)
         loss = None
         if targets is not None:
             shift = self.future_idx
@@ -336,6 +344,23 @@ class SwiGLU(nn.Module):
         return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
+class ReLU2MLP(nn.Module):
+    """Ungated MLP with squared-ReLU activation (modded-nanoGPT). Simpler and a bit
+    faster than SwiGLU; competitive quality at small scale."""
+
+    def __init__(self, config):
+        super().__init__()
+        n_embd = config["n_embd"]
+        hidden = 4 * n_embd
+        use_bitnet = config.get("use_bitnet", False)
+        use_fast_bitnet = config.get("use_fast_bitnet", False)
+        self.fc = make_linear(n_embd, hidden, bias=False, use_bitnet=use_bitnet, use_fast_bitnet=use_fast_bitnet)
+        self.proj = make_linear(hidden, n_embd, bias=False, use_bitnet=use_bitnet, use_fast_bitnet=use_fast_bitnet)
+
+    def forward(self, x):
+        return self.proj(F.relu(self.fc(x)).square())
+
+
 # --- Core model ---
 
 def make_norm(n_embd, use_rmsnorm=False):
@@ -356,6 +381,7 @@ class CausalSelfAttention(nn.Module):
             raise ValueError(f"n_head ({self.n_head}) must be divisible by n_kv_head ({self.n_kv_head})")
         self.head_dim = self.n_embd // self.n_head
         self.use_rope = config.get("use_rope", False)
+        self.use_qk_norm = config.get("use_qk_norm", False)
         use_bitnet = config.get("use_bitnet", False)
         use_fast_bitnet = config.get("use_fast_bitnet", False)
 
@@ -363,6 +389,11 @@ class CausalSelfAttention(nn.Module):
         self.k_proj = make_linear(self.n_embd, self.n_kv_head * self.head_dim, use_bitnet=use_bitnet, use_fast_bitnet=use_fast_bitnet)
         self.v_proj = make_linear(self.n_embd, self.n_kv_head * self.head_dim, use_bitnet=use_bitnet, use_fast_bitnet=use_fast_bitnet)
         self.proj = make_linear(self.n_embd, self.n_embd, use_bitnet=use_bitnet, use_fast_bitnet=use_fast_bitnet)
+
+        # QK-Norm (modded-nanoGPT): RMSNorm Q and K over the head dim before attention.
+        if self.use_qk_norm:
+            self.q_norm = nn.RMSNorm(self.head_dim)
+            self.k_norm = nn.RMSNorm(self.head_dim)
 
         if self.use_rope:
             self.rope = RotaryEmbedding(self.head_dim, max_seq_len=config.get("block_size", 512))
@@ -372,6 +403,10 @@ class CausalSelfAttention(nn.Module):
         q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         if self.use_rope:
             cos, sin = self.rope(pos_offset + T)
@@ -413,7 +448,9 @@ class Block(nn.Module):
         self.ln1 = make_norm(config["n_embd"], use_rmsnorm)
         self.attn = CausalSelfAttention(config)
         self.ln2 = make_norm(config["n_embd"], use_rmsnorm)
-        if config.get("use_swiglu", False):
+        if config.get("use_relu2", False):
+            self.mlp = ReLU2MLP(config)
+        elif config.get("use_swiglu", False):
             self.mlp = SwiGLU(config)
         else:
             self.mlp = MLP(config)
@@ -449,6 +486,7 @@ class GPT(nn.Module):
         self.use_turboquant = config.get("use_turboquant", False)
         self.turboquant_bits = config.get("turboquant_bits", 4)
         self.use_activation_checkpointing = config.get("use_activation_checkpointing", False)
+        self.logit_cap = config.get("logit_cap", 0)
         use_rmsnorm = config.get("use_rmsnorm", False)
 
         self.tok_emb = nn.Embedding(config["vocab_size"], config["n_embd"])
@@ -510,7 +548,7 @@ class GPT(nn.Module):
 
     def forward(self, idx, targets=None, return_hidden=False):
         hidden = self._compute_hidden(idx)
-        logits = self.lm_head(hidden)
+        logits = soft_cap(self.lm_head(hidden), self.logit_cap)
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
@@ -533,7 +571,7 @@ class GPT(nn.Module):
             for block, cache in zip(self.blocks, kv_caches or [None] * len(self.blocks)):
                 x = block(x, kv_cache=cache, pos_offset=pos_offset)
         hidden = self.ln_f(x)
-        logits = self.lm_head(hidden)
+        logits = soft_cap(self.lm_head(hidden), self.logit_cap)
         if return_hidden:
             return logits, hidden
         return logits
@@ -913,6 +951,16 @@ FAST_2060_MTP_FBITNET_CONFIG = {
     "use_fast_bitnet": True,
 }
 
+# modded-nanoGPT-style recipe. QK-Norm helps under any optimizer; ReLU2 and
+# logit_cap only pay off paired with Muon's higher LR. Train with --optimizer muon.
+FAST_2060_MODDED_CONFIG = {
+    **FAST_2060_MTP_CONFIG,
+    "use_swiglu": False,   # superseded by ReLU2 below
+    "use_relu2": True,
+    "use_qk_norm": True,
+    "logit_cap": 15.0,
+}
+
 FAST_2060_MTP_TURBO_CONFIG = {
     **FAST_2060_MTP_CONFIG,
     "use_turboquant": True,
@@ -954,6 +1002,7 @@ CONFIGS = {
     "fast_2060": FAST_2060_CONFIG,
     "fast_2060_mtp": FAST_2060_MTP_CONFIG,
     "fast_2060_mtp_fbitnet": FAST_2060_MTP_FBITNET_CONFIG,
+    "fast_2060_modded": FAST_2060_MODDED_CONFIG,
     "fast_2060_mtp_turbo": FAST_2060_MTP_TURBO_CONFIG,
     "tiny_fast": TINY_FAST_CONFIG,
     "low_memory_2060": LOW_MEMORY_2060_CONFIG,

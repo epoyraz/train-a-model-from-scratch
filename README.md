@@ -23,6 +23,9 @@ Decoder-only transformer with independently configurable techniques:
 | **GQA** | LLaMA 2 | Grouped Query Attention — shared KV heads, less VRAM | `n_kv_head: 2` |
 | **SwiGLU** | LLaMA | Gated MLP activation — better quality at same param count | `use_swiglu: True` |
 | **RMSNorm** | LLaMA | Simpler, faster normalization layer | `use_rmsnorm: True` |
+| **QK-Norm** | modded-nanoGPT | RMSNorm on Q and K before attention — stabilizes training, helps convergence | `use_qk_norm: True` |
+| **ReLU²** | modded-nanoGPT | Ungated MLP with squared-ReLU activation — simpler alternative to SwiGLU | `use_relu2: True` |
+| **Logit soft-cap** | Gemma 2 | `cap·tanh(logits/cap)` — bounds logits for stability | `logit_cap: 15.0` |
 | **MTP** | DeepSeek-V3 | Multi-Token Prediction — better sample efficiency + speculative decoding | `use_mtp: True` |
 | **mHC** | DeepSeek | Manifold-Constrained Hyper-Connections — learned residual routing | `use_mhc: True` |
 | **BitNet** | Microsoft | Ternary 1-bit weights with straight-through estimator | `use_bitnet: True` |
@@ -45,6 +48,7 @@ Training throughput on an RTX 2060 Super (batch 32), eager vs. `--compile`:
 | `fast_2060` | 19M | RTX 2060 (no MTP) | 90K | **127K** |
 | `fast_2060_mtp` | 19M | RTX 2060 with MTP | 58K | 89K |
 | `fast_2060_mtp_fbitnet` | 19M | INT8 BitNet inference | 58K | — |
+| `fast_2060_modded` | 19M | Best convergence (train with Muon) | 58K | — |
 | `modern` | 42M | Larger GPUs (24GB+) | 48K | ~1.4× |
 | `recommended` | 77M | Full featured | — | — |
 | `base` | 46.5M | Vanilla GPT baseline | — | — |
@@ -65,7 +69,31 @@ python tune_training.py --profiles fast_2060_mtp modern recommended
 | Optimizer | Description |
 |---|---|
 | **AdamW** | Standard adaptive optimizer (default) |
-| **Muon** | Newton-Schulz momentum — faster convergence for 2D+ weight matrices, paired with AdamW for embeddings/norms |
+| **Muon** | Newton-Schulz momentum for 2D+ weight matrices, paired with AdamW for embeddings/norms |
+
+```bash
+python train.py --profile fast_2060_modded --optimizer muon --max-lr 3e-3 --compile
+```
+
+### Measured convergence (RTX 2060 Super, `fast_2060`, 1,200 steps)
+
+| Config | Optimizer | Val loss | tok/s |
+|---|---|---|---|
+| baseline | AdamW | 2.30 | 86K |
+| + QK-Norm | AdamW | **2.27** | 76K |
+| + ReLU² | AdamW | 2.31 | 72K |
+| + logit-cap | AdamW | 2.33 | 74K |
+| baseline | Muon | **2.14** | 41K |
+| + all three (`fast_2060_modded`) | Muon | **2.13** | 35K |
+
+Takeaways from the A/B:
+- **QK-Norm** is the one technique that helps under plain AdamW — keep it on.
+- **ReLU²** and **logit soft-cap** only pay off paired with **Muon**'s higher LR (they slightly
+  hurt under AdamW), which is why `fast_2060_modded` is meant to be trained with `--optimizer muon`.
+- **Muon converges much better per step** (2.30 → 2.14) — but it's ~2× slower per step here
+  (Newton-Schulz overhead), so at *equal wall-clock* AdamW trains further (AdamW reached **1.99**
+  in the same ~240s that Muon used for 2.14). Muon is the choice when you're token/sample-limited
+  or want the best loss-per-token; AdamW + QK-Norm + `--compile` is the fastest by the clock.
 
 ## Setup
 

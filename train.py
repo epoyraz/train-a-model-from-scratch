@@ -72,7 +72,8 @@ def newton_schulz(M, steps=5):
     X = M / (M.norm() + 1e-7)
     for _ in range(steps):
         A = X @ X.T
-        X = a * X + b * (A @ X) + c * (A @ (A @ X))
+        AX = A @ X  # reuse; the quintic needs A@X and A@(A@X), not A@X twice
+        X = a * X + b * AX + c * (A @ AX)
     return X
 
 
