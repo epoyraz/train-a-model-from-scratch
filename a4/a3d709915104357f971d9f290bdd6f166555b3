@@ -1,0 +1,19 @@
+model.py
+  s_d55a0a454e2bc6::t_ea71a4ed541b27 111-117,127-129,131,133
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "a4a3d709915104357f971d9f290bdd6f166555b3",
+  "prompts": {},
+  "sessions": {
+    "s_d55a0a454e2bc6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "299b172e-092d-4066-bdd2-96626d02c786",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    }
+  }
+}
