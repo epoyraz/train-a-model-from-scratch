@@ -1,0 +1,7 @@
+data/
+checkpoints/
+tokenizer.json
+__pycache__/
+*.pt
+*.npy
+*.pyc
