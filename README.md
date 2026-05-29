@@ -266,16 +266,17 @@ Verifies mathematical properties of each technique:
 
 ## Training Results
 
-On RTX 2060 Super (8GB VRAM), `fast_2060_mtp`, batch 32, 3,000 steps — the run that
-produced [epoyraz/tinystories-25m](https://huggingface.co/epoyraz/tinystories-25m):
+On RTX 2060 Super (8GB VRAM), `fast_2060_modded` + Muon + `--compile`, batch 40, 3,000
+steps — the run that produced [epoyraz/tinystories-25m](https://huggingface.co/epoyraz/tinystories-25m):
 
-| Steps | Train Loss | Val Loss | Time (eager) | tok/s |
-|---|---|---|---|---|
-| 3,000 | 2.62 | 2.65 | ~7 min | 58K |
+| Recipe | Steps | Val Loss | Time |
+|---|---|---|---|
+| `fast_2060_mtp` + AdamW (baseline) | 3,000 | 2.65 | ~7 min |
+| `fast_2060_modded` + Muon + zero-init | 3,000 | **2.40** | ~8 min |
 
 Loss is the combined objective (next-token cross-entropy + `mtp_weight` × MTP auxiliary);
-the pure next-token CE is lower. With `--compile`, the same run finishes in ~4.5 min.
-Longer training continues to lower loss.
+the pure next-token CE is lower. The modded recipe (QK-norm + ReLU² + logit-cap + zero-init,
+trained with Muon) is a measured ~0.25 improvement over the AdamW baseline at equal steps.
 
 ## Project Structure
 
