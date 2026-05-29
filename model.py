@@ -419,7 +419,7 @@ class GPT(nn.Module):
 
         for i in range(max_new_tokens):
             logits_last = logits[:, -1, :] / temperature
-            if top_k is not None:
+            if top_k is not None and top_k > 0:
                 k = min(top_k, logits_last.size(-1))
                 v, _ = torch.topk(logits_last, k)
                 logits_last[logits_last < v[:, [-1]]] = -float("inf")
