@@ -111,8 +111,16 @@ class FastBitLinear(nn.Module):
         shape = x_q.shape
         x_2d = x_q.reshape(-1, shape[-1])
 
-        y_pos = torch._int_mm(x_2d, w_pos.T)
-        y_neg = torch._int_mm(x_2d, w_neg.T)
+        rows = x_2d.shape[0]
+        if rows <= 16:
+            pad = 17 - rows
+            x_2d = torch.nn.functional.pad(x_2d, (0, 0, 0, pad))
+            y_pos = torch._int_mm(x_2d, w_pos.T)[:rows]
+            y_neg = torch._int_mm(x_2d, w_neg.T)[:rows]
+        else:
+            y_pos = torch._int_mm(x_2d, w_pos.T)
+            y_neg = torch._int_mm(x_2d, w_neg.T)
+
         y = (y_pos - y_neg).float().reshape(*shape[:-1], self.out_features)
         return y * (alpha / x_scale)
 

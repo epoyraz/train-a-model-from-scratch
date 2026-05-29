@@ -29,6 +29,11 @@ def parse_args():
 
 
 def load_model(checkpoint_path):
+    probe = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if probe.get("format") == "ternary_packed":
+        from export_ternary import load_ternary
+        model, config = load_ternary(checkpoint_path, device=DEVICE)
+        return model, {"config": config, "step": probe.get("step", 0)}
     ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=True)
     model = GPT(ckpt["config"]).to(DEVICE)
     model.load_state_dict(ckpt["model"])

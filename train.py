@@ -47,7 +47,9 @@ def build_model_name(config, dataset_name="tinystories"):
         tags.append("mtp")
     if _truthy(config, "use_mhc"):
         tags.append("mhc")
-    if _truthy(config, "use_bitnet"):
+    if _truthy(config, "use_fast_bitnet"):
+        tags.append("fbitnet")
+    elif _truthy(config, "use_bitnet"):
         tags.append("bitnet")
     suffix = "-".join(tags)
     if suffix:
