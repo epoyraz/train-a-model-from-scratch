@@ -884,6 +884,11 @@ FAST_2060_MTP_CONFIG = {
     "tie_mtp_lm_head": True,
 }
 
+FAST_2060_MTP_FBITNET_CONFIG = {
+    **FAST_2060_MTP_CONFIG,
+    "use_fast_bitnet": True,
+}
+
 FAST_2060_MTP_TURBO_CONFIG = {
     **FAST_2060_MTP_CONFIG,
     "use_turboquant": True,
@@ -924,6 +929,7 @@ CONFIGS = {
     "recommended": RECOMMENDED_CONFIG,
     "fast_2060": FAST_2060_CONFIG,
     "fast_2060_mtp": FAST_2060_MTP_CONFIG,
+    "fast_2060_mtp_fbitnet": FAST_2060_MTP_FBITNET_CONFIG,
     "fast_2060_mtp_turbo": FAST_2060_MTP_TURBO_CONFIG,
     "tiny_fast": TINY_FAST_CONFIG,
     "low_memory_2060": LOW_MEMORY_2060_CONFIG,
