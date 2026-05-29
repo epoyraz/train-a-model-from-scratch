@@ -319,9 +319,10 @@ class SwiGLU(nn.Module):
         hidden = int(4 * n_embd * 2 / 3)
         hidden = ((hidden + 63) // 64) * 64
         use_bitnet = config.get("use_bitnet", False)
-        self.gate = make_linear(n_embd, hidden, bias=False, use_bitnet=use_bitnet)
-        self.up = make_linear(n_embd, hidden, bias=False, use_bitnet=use_bitnet)
-        self.down = make_linear(hidden, n_embd, bias=False, use_bitnet=use_bitnet)
+        use_fast_bitnet = config.get("use_fast_bitnet", False)
+        self.gate = make_linear(n_embd, hidden, bias=False, use_bitnet=use_bitnet, use_fast_bitnet=use_fast_bitnet)
+        self.up = make_linear(n_embd, hidden, bias=False, use_bitnet=use_bitnet, use_fast_bitnet=use_fast_bitnet)
+        self.down = make_linear(hidden, n_embd, bias=False, use_bitnet=use_bitnet, use_fast_bitnet=use_fast_bitnet)
 
     def forward(self, x):
         return self.down(F.silu(self.gate(x)) * self.up(x))
@@ -348,11 +349,12 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.n_embd // self.n_head
         self.use_rope = config.get("use_rope", False)
         use_bitnet = config.get("use_bitnet", False)
+        use_fast_bitnet = config.get("use_fast_bitnet", False)
 
-        self.q_proj = make_linear(self.n_embd, self.n_head * self.head_dim, use_bitnet=use_bitnet)
-        self.k_proj = make_linear(self.n_embd, self.n_kv_head * self.head_dim, use_bitnet=use_bitnet)
-        self.v_proj = make_linear(self.n_embd, self.n_kv_head * self.head_dim, use_bitnet=use_bitnet)
-        self.proj = make_linear(self.n_embd, self.n_embd, use_bitnet=use_bitnet)
+        self.q_proj = make_linear(self.n_embd, self.n_head * self.head_dim, use_bitnet=use_bitnet, use_fast_bitnet=use_fast_bitnet)
+        self.k_proj = make_linear(self.n_embd, self.n_kv_head * self.head_dim, use_bitnet=use_bitnet, use_fast_bitnet=use_fast_bitnet)
+        self.v_proj = make_linear(self.n_embd, self.n_kv_head * self.head_dim, use_bitnet=use_bitnet, use_fast_bitnet=use_fast_bitnet)
+        self.proj = make_linear(self.n_embd, self.n_embd, use_bitnet=use_bitnet, use_fast_bitnet=use_fast_bitnet)
 
         if self.use_rope:
             self.rope = RotaryEmbedding(self.head_dim, max_seq_len=config.get("block_size", 512))
@@ -387,8 +389,9 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         use_bitnet = config.get("use_bitnet", False)
-        self.fc = make_linear(config["n_embd"], 4 * config["n_embd"], use_bitnet=use_bitnet)
-        self.proj = make_linear(4 * config["n_embd"], config["n_embd"], use_bitnet=use_bitnet)
+        use_fast_bitnet = config.get("use_fast_bitnet", False)
+        self.fc = make_linear(config["n_embd"], 4 * config["n_embd"], use_bitnet=use_bitnet, use_fast_bitnet=use_fast_bitnet)
+        self.proj = make_linear(4 * config["n_embd"], config["n_embd"], use_bitnet=use_bitnet, use_fast_bitnet=use_fast_bitnet)
 
     def forward(self, x):
         return self.proj(F.gelu(self.fc(x)))
@@ -828,6 +831,7 @@ BASE_CONFIG = {
 # Individual techniques
 MHC_CONFIG = {**BASE_CONFIG, "use_mhc": True, "mhc_streams": 4}
 BITNET_CONFIG = {**BASE_CONFIG, "use_bitnet": True}
+FAST_BITNET_CONFIG = {**BASE_CONFIG, "use_fast_bitnet": True}
 MTP_CONFIG = {**BASE_CONFIG, "use_mtp": True, "mtp_heads": 4, "mtp_weight": 0.1}
 ROPE_CONFIG = {**BASE_CONFIG, "use_rope": True}
 GQA_CONFIG = {**BASE_CONFIG, "n_kv_head": 2}
