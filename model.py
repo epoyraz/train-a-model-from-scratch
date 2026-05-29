@@ -234,6 +234,10 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config["n_head"]
         self.n_embd = config["n_embd"]
         self.n_kv_head = config.get("n_kv_head", self.n_head)
+        if self.n_embd % self.n_head != 0:
+            raise ValueError(f"n_embd ({self.n_embd}) must be divisible by n_head ({self.n_head})")
+        if self.n_head % self.n_kv_head != 0:
+            raise ValueError(f"n_head ({self.n_head}) must be divisible by n_kv_head ({self.n_kv_head})")
         self.head_dim = self.n_embd // self.n_head
         self.use_rope = config.get("use_rope", False)
         use_bitnet = config.get("use_bitnet", False)
@@ -407,6 +411,9 @@ class GPT(nn.Module):
 
     def generate(self, idx, max_new_tokens, temperature=0.8, top_k=40):
         block_size = self.config["block_size"]
+        if idx.shape[1] == 0:
+            eos_id = 1
+            idx = torch.tensor([[eos_id]], dtype=idx.dtype, device=idx.device)
         idx = idx[:, -block_size:]
         has_cache = self.use_turboquant
         kv_caches = None
@@ -418,6 +425,22 @@ class GPT(nn.Module):
         logits = self._forward_inference(x, kv_caches, pos_offset=0)
 
         for i in range(max_new_tokens):
+            if temperature <= 0:
+                idx_next = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+                idx = torch.cat([idx, idx_next], dim=1)
+                if i < max_new_tokens - 1:
+                    cur_pos = seq_len + i
+                    if has_cache and cur_pos < block_size:
+                        x = self._embed(idx_next, pos_offset=cur_pos)
+                        logits = self._forward_inference(x, kv_caches, pos_offset=cur_pos)
+                    else:
+                        if kv_caches:
+                            for c in kv_caches:
+                                c.clear()
+                        idx_cond = idx[:, -block_size:]
+                        x = self._embed(idx_cond)
+                        logits = self._forward_inference(x, kv_caches, pos_offset=0)
+                continue
             logits_last = logits[:, -1, :] / temperature
             if top_k is not None and top_k > 0:
                 k = min(top_k, logits_last.size(-1))
