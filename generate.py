@@ -99,10 +99,11 @@ def main():
     if args.compile:
         if DEVICE == "cuda":
             ensure_msvc_env()  # Triton needs MSVC on PATH to build CUDA shims on Windows
-        # Compiling the per-step forward removes Python/launch overhead during decode.
-        # The first few generations are slow (compilation + shape specialization).
-        model._forward_inference = torch.compile(model._forward_inference)
-        print("Compiled decode step (first generation will be slow while compiling).")
+        # dynamic=True is essential: the KV-cache sequence length changes every step and
+        # every prompt, so static compilation would recompile per length (slower than eager).
+        # Dynamic shapes compile once and then run any prompt length at a steady ~160 tok/s.
+        model._forward_inference = torch.compile(model._forward_inference, dynamic=True)
+        print("Compiled decode step (dynamic shapes; first generation is slow while compiling).")
 
     if args.speculative and not config.get("use_mtp", False):
         print("Speculative mode requested, but this checkpoint has no MTP heads. Falling back to normal generation.")

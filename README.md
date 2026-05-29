@@ -11,7 +11,7 @@ dress-up and play with her toys. One day, Lily's mommy took her to the store
 to buy a new dress. Lily's mommy bought it for her and Lily was so happy...
 ```
 
-Trained on an RTX 2060 Super; generates at **130 tok/s** with `torch.compile` decoding (66 tok/s eager). A trained 19M checkpoint is on the Hub: [**epoyraz/tinystories-25m**](https://huggingface.co/epoyraz/tinystories-25m).
+Trained on an RTX 2060 Super; generates at **~160 tok/s** with `torch.compile` (dynamic-shape) decoding, vs **~90 tok/s** eager. A trained 19M checkpoint is on the Hub: [**epoyraz/tinystories-25m**](https://huggingface.co/epoyraz/tinystories-25m).
 
 ## Architecture
 
@@ -26,6 +26,7 @@ Decoder-only transformer with independently configurable techniques:
 | **QK-Norm** | modded-nanoGPT | RMSNorm on Q and K before attention — stabilizes training, helps convergence | `use_qk_norm: True` |
 | **ReLU²** | modded-nanoGPT | Ungated MLP with squared-ReLU activation — simpler alternative to SwiGLU | `use_relu2: True` |
 | **Logit soft-cap** | Gemma 2 | `cap·tanh(logits/cap)` — bounds logits for stability | `logit_cap: 15.0` |
+| **Zero-init** | modded-nanoGPT | Zero-init block output projections (muP-like) — each block starts as identity | `use_zero_init: True` |
 | **MTP** | DeepSeek-V3 | Multi-Token Prediction — better sample efficiency + speculative decoding | `use_mtp: True` |
 | **mHC** | DeepSeek | Manifold-Constrained Hyper-Connections — learned residual routing | `use_mhc: True` |
 | **BitNet** | Microsoft | Ternary 1-bit weights with straight-through estimator | `use_bitnet: True` |
@@ -84,12 +85,15 @@ python train.py --profile fast_2060_modded --optimizer muon --max-lr 3e-3 --comp
 | + ReLU² | AdamW | 2.31 | 72K |
 | + logit-cap | AdamW | 2.33 | 74K |
 | baseline | Muon | **2.14** | 41K |
-| + all three (`fast_2060_modded`) | Muon | **2.13** | 35K |
+| + all three | Muon | **2.13** | 35K |
+| + all three + **zero-init** (`fast_2060_modded`) | Muon | **2.04** | 35K |
 
 Takeaways from the A/B:
 - **QK-Norm** is the one technique that helps under plain AdamW — keep it on.
 - **ReLU²** and **logit soft-cap** only pay off paired with **Muon**'s higher LR (they slightly
   hurt under AdamW), which is why `fast_2060_modded` is meant to be trained with `--optimizer muon`.
+- **Zero-init** (zeroing block output projections) is free (an init change) and lowered val
+  loss 2.13 → 2.04 at equal steps — baked into the modded profiles.
 - **Muon converges much better per step** (2.30 → 2.14) — but it's ~2× slower per step here
   (Newton-Schulz overhead), so at *equal wall-clock* AdamW trains further (AdamW reached **1.99**
   in the same ~240s that Muon used for 2.14). Muon is the choice when you're token/sample-limited
@@ -181,7 +185,7 @@ python generate.py
 # Custom one-shot prompt
 python generate.py --prompt "Once upon a time," --temperature 0.7
 
-# Fastest sustained/interactive decoding (~2x via torch.compile; ~20s warmup)
+# Faster sustained/interactive decoding (~1.8x via torch.compile; one-time warmup)
 python generate.py --compile --temperature 0.7
 
 # Adjust sampling
@@ -195,8 +199,9 @@ python generate.py --help
 ```
 
 Defaults: `--max-tokens 200`, `--temperature 0.8`, `--top-k 40`, KV cache **on**.
-`--compile` gives ~130 tok/s (vs ~66 eager) but pays a one-time compile cost, so it
-only helps for the REPL / many generations — skip it for a single one-shot prompt.
+`--compile` gives ~160 tok/s (vs ~90 eager) using dynamic-shape compilation, but pays a
+one-time compile cost on the first generation — so it only helps for the REPL / many
+generations; skip it for a single one-shot prompt.
 `--speculative` (MTP draft + batched verify) and `--turboquant` (KV compression) are
 implemented and correct, but both measured **slower** than plain compiled decode on a
 19M model / RTX 2060, so they are opt-in and off by default.
