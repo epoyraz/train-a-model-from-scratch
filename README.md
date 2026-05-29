@@ -11,11 +11,11 @@ dress-up and play with her toys. One day, Lily's mommy took her to the store
 to buy a new dress. Lily's mommy bought it for her and Lily was so happy...
 ```
 
-Generated at **85 tok/s** with speculative decoding on an RTX 2060 Super.
+Trained on an RTX 2060 Super; generates at **130 tok/s** with `torch.compile` decoding (66 tok/s eager). A trained 19M checkpoint is on the Hub: [**epoyraz/tinystories-25m**](https://huggingface.co/epoyraz/tinystories-25m).
 
 ## Architecture
 
-Decoder-only transformer with 8 independently configurable techniques:
+Decoder-only transformer with independently configurable techniques:
 
 | Technique | Origin | What it does | Config Flag |
 |---|---|---|---|
@@ -26,20 +26,32 @@ Decoder-only transformer with 8 independently configurable techniques:
 | **MTP** | DeepSeek-V3 | Multi-Token Prediction — better sample efficiency + speculative decoding | `use_mtp: True` |
 | **mHC** | DeepSeek | Manifold-Constrained Hyper-Connections — learned residual routing | `use_mhc: True` |
 | **BitNet** | Microsoft | Ternary 1-bit weights with straight-through estimator | `use_bitnet: True` |
+| **FastBitNet** | Microsoft | BitNet with INT8 tensor-core matmuls at inference (`torch._int_mm`) | `use_fast_bitnet: True` |
 | **TurboQuant** | Google | KV-cache compression via PolarQuant + QJL | `use_turboquant: True` |
+
+`use_fast_bitnet` trains with straight-through ternary (like BitNet) but runs inference
+through INT8 tensor cores; such checkpoints can be packed to ~2 bits/weight with
+`export_ternary.py` (8× smaller on disk).
 
 ## Training Profiles
 
 Pre-configured profiles optimized for different hardware:
 
-| Profile | Params | Best for | tok/s (2060) |
-|---|---|---|---|
-| `tiny_fast` | 8.6M | Quick experiments | 173K |
-| `fast_2060` | 18.9M | RTX 2060 (no MTP) | 95K |
-| `fast_2060_mtp` | 19.2M | RTX 2060 with MTP | 57K |
-| `modern` | 42.2M | Larger GPUs (24GB+) | 48K |
-| `recommended` | 77M | Full featured | — |
-| `base` | 46.5M | Vanilla GPT baseline | — |
+Training throughput on an RTX 2060 Super (batch 32), eager vs. `--compile`:
+
+| Profile | Params | Best for | tok/s eager | tok/s `--compile` |
+|---|---|---|---|---|
+| `tiny_fast` | 8.6M | Quick experiments | 173K | ~1.4× |
+| `fast_2060` | 19M | RTX 2060 (no MTP) | 90K | **127K** |
+| `fast_2060_mtp` | 19M | RTX 2060 with MTP | 58K | 89K |
+| `fast_2060_mtp_fbitnet` | 19M | INT8 BitNet inference | 58K | — |
+| `modern` | 42M | Larger GPUs (24GB+) | 48K | ~1.4× |
+| `recommended` | 77M | Full featured | — | — |
+| `base` | 46.5M | Vanilla GPT baseline | — | — |
+
+`torch.compile` gives a measured **1.4–1.5×** speedup (see [torch.compile setup](#torchcompile-speedup-windows)).
+MTP profiles are heavier (the extra prediction heads each run a full-vocab projection),
+so they cap lower than the no-MTP profiles.
 
 Find the optimal profile for your hardware:
 
@@ -98,9 +110,29 @@ python train.py --profile fast_2060_mtp --optimizer muon --max-lr 3e-3
 # With activation checkpointing (saves ~40% VRAM)
 python train.py --profile modern --activation-checkpointing
 
+# With torch.compile (1.4-1.5x faster; see setup below)
+python train.py --profile fast_2060 --compile
+
 # All options
 python train.py --help
 ```
+
+#### torch.compile speedup (Windows)
+
+`torch.compile` is the single biggest speed lever — **1.4–1.5× training, ~2× inference**,
+and it's numerically lossless (verified: compiled and eager give identical validation
+loss to ~1e-7). It needs a Triton backend plus a C compiler:
+
+```bash
+pip install triton-windows        # Triton build with Windows wheels (incl. cp314)
+```
+
+Triton also needs **MSVC** (`cl.exe`) to build its CUDA shims — the mingw `gcc` that's
+often on PATH will fail. Install the **"Desktop development with C++"** workload from
+[Visual Studio Build Tools](https://visualstudio.microsoft.com/downloads/). You do **not**
+need to configure PATH yourself: `msvc_env.py` locates and activates MSVC automatically
+whenever you pass `--compile`. (On Linux/macOS, `pip install triton` + a system compiler
+is all that's needed.)
 
 ### 4. Monitor training live
 
@@ -115,14 +147,14 @@ Opens a Gradio dashboard at `http://127.0.0.1:7860` with real-time loss curves, 
 ### 5. Generate text
 
 ```bash
-# Default prompts + interactive mode
+# Default prompts + interactive REPL (type a prompt, "quit" to exit)
 python generate.py
 
-# Custom prompt
-python generate.py --prompt "Once upon a time,"
+# Custom one-shot prompt
+python generate.py --prompt "Once upon a time," --temperature 0.7
 
-# With speculative decoding (uses MTP heads, ~30x faster)
-python generate.py --no-turboquant --speculative
+# Fastest sustained/interactive decoding (~2x via torch.compile; ~20s warmup)
+python generate.py --compile --temperature 0.7
 
 # Adjust sampling
 python generate.py --temperature 0.6 --top-k 50 --max-tokens 300
@@ -133,6 +165,13 @@ python generate.py --temperature 0
 # All options
 python generate.py --help
 ```
+
+Defaults: `--max-tokens 200`, `--temperature 0.8`, `--top-k 40`, KV cache **on**.
+`--compile` gives ~130 tok/s (vs ~66 eager) but pays a one-time compile cost, so it
+only helps for the REPL / many generations — skip it for a single one-shot prompt.
+`--speculative` (MTP draft + batched verify) and `--turboquant` (KV compression) are
+implemented and correct, but both measured **slower** than plain compiled decode on a
+19M model / RTX 2060, so they are opt-in and off by default.
 
 ### 6. Evaluate checkpoints
 
@@ -145,9 +184,9 @@ Runs all checkpoints against the validation set, prints loss and perplexity:
 ```
 Checkpoint                         Val Loss   Perplexity
 -------------------------------------------------------
-step_1000.pt                         2.8432        17.17
-step_2000.pt                         2.1856         8.90
-final.pt                             1.8731         6.51
+step_1000.pt                         2.9417        18.95
+step_2000.pt                         2.7185        15.16
+final.pt                             2.6515        14.18
 ```
 
 ### 7. Benchmark configurations
@@ -175,25 +214,32 @@ Verifies mathematical properties of each technique:
 
 ## Training Results
 
-On RTX 2060 Super (8GB VRAM):
+On RTX 2060 Super (8GB VRAM), `fast_2060_mtp`, batch 32, 3,000 steps — the run that
+produced [epoyraz/tinystories-25m](https://huggingface.co/epoyraz/tinystories-25m):
 
-| Profile | Steps | Final Loss | Val Loss | Time | tok/s |
-|---|---|---|---|---|---|
-| `fast_2060_mtp` (batch 32) | 3,000 | 1.87 | ~1.90 | ~7 min | 56K |
-| `fast_2060` (batch 40) | 3,000 | 1.87 | ~1.90 | ~18 min | 90K |
+| Steps | Train Loss | Val Loss | Time (eager) | tok/s |
+|---|---|---|---|---|
+| 3,000 | 2.62 | 2.65 | ~7 min | 58K |
+
+Loss is the combined objective (next-token cross-entropy + `mtp_weight` × MTP auxiliary);
+the pure next-token CE is lower. With `--compile`, the same run finishes in ~4.5 min.
+Longer training continues to lower loss.
 
 ## Project Structure
 
 ```
 config.py              Shared device, dtype, and path configuration
-model.py               GPT model with all 8 configurable techniques
-train.py               Training loop with CLI, profiles, Muon/AdamW, Trackio
+model.py               GPT model with all configurable techniques
+train.py               Training loop with CLI, profiles, Muon/AdamW, torch.compile, Trackio
 train_tokenizer.py     BPE tokenizer training (16K vocab)
 download_data.py       TinyStories dataset download from HuggingFace
-generate.py            Text generation with speculative decoding + interactive mode
+generate.py            Text generation: KV cache, speculative decoding, --compile, REPL
 evaluate.py            Validation loss and perplexity across checkpoints
 benchmark.py           Speed and memory benchmarks across all configs
-test_techniques.py     Correctness tests for all techniques
+export_ternary.py      Pack FastBitLinear weights to ~2 bits/weight (8x smaller)
+msvc_env.py            Auto-activates MSVC so torch.compile works on Windows
+test_techniques.py     Correctness tests for all techniques (115 tests)
+test_fast_bitnet.py    FastBitLinear INT8 correctness/speed/convergence tests (26 tests)
 tune_training.py       Auto-detect optimal profile and batch size for your GPU
 ```
 

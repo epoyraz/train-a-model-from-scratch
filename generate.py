@@ -6,6 +6,7 @@ from tokenizers import Tokenizer
 
 from config import CHECKPOINT_DIR, DEVICE, TOKENIZER_PATH
 from model import GPT
+from msvc_env import ensure_msvc_env
 
 
 DEFAULT_CHECKPOINT = f"{CHECKPOINT_DIR}/final.pt"
@@ -25,6 +26,8 @@ def parse_args():
     parser.add_argument("--turboquant", action="store_true")
     parser.add_argument("--no-turboquant", action="store_true")
     parser.add_argument("--no-kv-cache", action="store_true")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile the decode step (~2x faster after warmup; needs MSVC+Triton)")
     return parser.parse_args()
 
 
@@ -92,6 +95,14 @@ def main():
     model, ckpt = load_model(args.checkpoint)
     config = ckpt["config"]
     use_turboquant = resolve_turboquant(args, config)
+
+    if args.compile:
+        if DEVICE == "cuda":
+            ensure_msvc_env()  # Triton needs MSVC on PATH to build CUDA shims on Windows
+        # Compiling the per-step forward removes Python/launch overhead during decode.
+        # The first few generations are slow (compilation + shape specialization).
+        model._forward_inference = torch.compile(model._forward_inference)
+        print("Compiled decode step (first generation will be slow while compiling).")
 
     if args.speculative and not config.get("use_mtp", False):
         print("Speculative mode requested, but this checkpoint has no MTP heads. Falling back to normal generation.")

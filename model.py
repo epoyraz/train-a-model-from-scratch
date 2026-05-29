@@ -676,6 +676,15 @@ class GPT(nn.Module):
             draft_probs.append(probs)
         return draft_tokens, draft_probs
 
+    def _resample_on_reject(self, target_token, p_probs, q_probs, temperature):
+        if temperature <= 0:
+            return target_token
+        residual = (p_probs - q_probs).clamp(min=0)
+        denom = residual.sum(dim=-1, keepdim=True)
+        if denom.item() <= 1e-12:
+            return target_token
+        return torch.multinomial(residual / denom, num_samples=1)
+
     def _mtp_speculative_generate(
         self,
         idx,
@@ -688,7 +697,11 @@ class GPT(nn.Module):
         use_turboquant=None,
         use_kv_cache=True,
     ):
-        if not self.use_mtp or idx.size(0) != 1:
+        use_turboquant = self.use_turboquant if use_turboquant is None else use_turboquant
+        # Batched verification needs a single sequence, MTP draft heads, and the
+        # plain (rollback-able) KV cache. TurboQuant's cache cannot be rolled back
+        # token-by-token, so fall back to autoregressive there.
+        if not self.use_mtp or idx.size(0) != 1 or not use_kv_cache or use_turboquant:
             return self._generate_autoregressive(
                 idx,
                 max_new_tokens,
@@ -701,91 +714,94 @@ class GPT(nn.Module):
             )
 
         idx = self._trim_or_seed_prompt(idx)
-        use_turboquant = self.use_turboquant if use_turboquant is None else use_turboquant
+        block_size = self.config["block_size"]
         draft_width = speculate_tokens or self.mtp_heads_n
         draft_width = max(1, min(draft_width, self.mtp_heads_n))
 
         logits, last_hidden, kv_caches, seq_len = self._prefill_generation(
-            idx,
-            use_turboquant=use_turboquant,
-            use_kv_cache=use_kv_cache,
+            idx, use_turboquant=False, use_kv_cache=True
         )
+        # p0 = main-model logits for the next token (verifies the first draft).
+        p0_logits = logits[:, -1, :]
         generated = 0
 
         while generated < max_new_tokens:
             remaining = max_new_tokens - generated
             n_draft = min(draft_width, remaining)
-            draft_tokens, draft_probs = self._mtp_draft(
-                last_hidden,
-                n_draft,
-                temperature=temperature,
-                top_k=top_k,
-                top_p=top_p,
-                min_p=min_p,
-            )
-            accepted_all = True
 
-            for draft_token, q_probs in zip(draft_tokens, draft_probs):
-                target_token, p_probs = self._distribution(
-                    logits[:, -1, :],
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                    min_p=min_p,
-                )
-
-                if temperature <= 0:
-                    accept = torch.equal(draft_token, target_token)
-                else:
-                    proposed = draft_token.item()
-                    p = p_probs[0, proposed]
-                    q = q_probs[0, proposed].clamp(min=1e-12)
-                    accept_prob = torch.minimum(torch.ones_like(p), p / q)
-                    accept = torch.rand((), device=idx.device) <= accept_prob
-
-                if accept:
-                    idx_next = draft_token
-                else:
-                    accepted_all = False
-                    if temperature <= 0:
-                        idx_next = target_token
-                    else:
-                        residual = (p_probs - q_probs).clamp(min=0)
-                        denom = residual.sum(dim=-1, keepdim=True)
-                        if denom.item() <= 1e-12:
-                            idx_next = target_token
-                        else:
-                            idx_next = torch.multinomial(residual / denom, num_samples=1)
-
-                idx = torch.cat([idx, idx_next], dim=1)
-                generated += 1
-                if generated >= max_new_tokens:
-                    break
-
-                logits, last_hidden, kv_caches, seq_len = self._advance_generation_state(
-                    idx, idx_next, kv_caches, seq_len, use_turboquant
-                )
-
-                if not accepted_all:
-                    break
-
-            if generated >= max_new_tokens:
-                break
-
-            if accepted_all:
-                idx_next, _ = self._distribution(
-                    logits[:, -1, :],
-                    temperature=temperature,
-                    top_k=top_k,
-                    top_p=top_p,
-                    min_p=min_p,
-                )
+            # No room left in the cache window: take one plain step (this slides the
+            # window via re-prefill inside _advance_generation_state) and continue.
+            if seq_len + n_draft > block_size:
+                idx_next, _ = self._distribution(p0_logits, temperature, top_k, top_p, min_p)
                 idx = torch.cat([idx, idx_next], dim=1)
                 generated += 1
                 if generated < max_new_tokens:
                     logits, last_hidden, kv_caches, seq_len = self._advance_generation_state(
-                        idx, idx_next, kv_caches, seq_len, use_turboquant
+                        idx, idx_next, kv_caches, seq_len, False
                     )
+                    p0_logits = logits[:, -1, :]
+                continue
+
+            # 1. Draft n tokens cheaply from the MTP heads (no main-model forward).
+            draft_tokens, draft_probs = self._mtp_draft(
+                last_hidden, n_draft, temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p
+            )
+            draft_seq = torch.cat(draft_tokens, dim=1)
+
+            # 2. Verify ALL drafts in a SINGLE main-model forward pass.
+            x = self._embed(draft_seq, pos_offset=seq_len)
+            v_logits, v_hidden = self._forward_inference(
+                x, kv_caches, pos_offset=seq_len, return_hidden=True
+            )
+
+            # 3. Walk the drafts left-to-right; draft j is checked against the main
+            #    distribution at the previous position (p0 for j=0, else v_logits[j-1]).
+            accepted = 0
+            reject_token = None
+            for j in range(n_draft):
+                target_logits = p0_logits if j == 0 else v_logits[:, j - 1, :]
+                target_token, p_probs = self._distribution(
+                    target_logits, temperature, top_k, top_p, min_p
+                )
+                if temperature <= 0:
+                    accept = torch.equal(draft_tokens[j], target_token)
+                else:
+                    proposed = draft_tokens[j].item()
+                    p = p_probs[0, proposed]
+                    q = draft_probs[j][0, proposed].clamp(min=1e-12)
+                    accept = torch.rand((), device=idx.device) <= torch.minimum(torch.ones_like(p), p / q)
+                if accept:
+                    accepted += 1
+                else:
+                    reject_token = self._resample_on_reject(
+                        target_token, p_probs, draft_probs[j], temperature
+                    )
+                    break
+
+            if accepted == n_draft:
+                # Every draft matched the main model: commit them all. The cache
+                # already holds them and v_hidden/v_logits give the next draft state
+                # for free (no extra forward, no separate bonus token needed).
+                idx = torch.cat([idx, draft_seq], dim=1)
+                generated += n_draft
+                seq_len += n_draft
+                last_hidden = v_hidden[:, -1:, :]
+                p0_logits = v_logits[:, -1, :]
+            else:
+                # Commit the accepted prefix plus the corrected token, then roll the
+                # cache back to drop the rejected drafts' (now stale) KV entries.
+                commit = torch.cat(draft_tokens[:accepted] + [reject_token], dim=1)
+                idx = torch.cat([idx, commit], dim=1)
+                generated += accepted + 1
+                for cache in kv_caches:
+                    cache.pos = seq_len + accepted
+                seq_len += accepted
+                if generated < max_new_tokens:
+                    # reject_token's KV/hidden are not cached yet; one short forward rebases.
+                    logits, last_hidden, kv_caches, seq_len = self._advance_generation_state(
+                        idx, reject_token, kv_caches, seq_len, False
+                    )
+                    p0_logits = logits[:, -1, :]
 
         return idx
 

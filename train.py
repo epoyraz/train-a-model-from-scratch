@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from config import CHECKPOINT_DIR, DATA_DIR, DEVICE, DTYPE, TOKENIZER_PATH, TRAIN_TOKENS_CACHE, VAL_TOKENS_CACHE
 from model import CONFIGS, GPT, get_model_config
+from msvc_env import ensure_msvc_env
 
 
 DEFAULT_BATCH_SIZE = 40
@@ -285,7 +286,10 @@ def evaluate_loss(model, loader, max_batches):
 def main():
     args = parse_args()
     if DEVICE == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = False
+        # TF32 is a large fp32-matmul speedup on Ampere+ (RTX 30xx/40xx) at
+        # negligible quality cost; it is simply ignored on Turing (RTX 20xx).
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
 
     max_lr = args.max_lr
@@ -353,7 +357,9 @@ def main():
     raw_model = GPT(model_config).to(DEVICE)
     model = raw_model
     if args.compile:
-        print("Compiling model with torch.compile...")
+        if DEVICE == "cuda":
+            ensure_msvc_env()  # Triton needs MSVC on PATH to build CUDA shims on Windows
+        print("Compiling model with torch.compile (first step is slow)...")
         model = torch.compile(model)
 
     n_params = sum(p.numel() for p in raw_model.parameters())
@@ -375,7 +381,7 @@ def main():
     print(f"Training for {args.max_steps} steps...\n")
 
     step = 0
-    running_loss = 0.0
+    running_loss = None  # accumulated on-GPU; synced to CPU only at log time
     t0 = time.time()
     data_iter = iter(loader)
 
@@ -386,7 +392,7 @@ def main():
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
-        accum_loss = 0.0
+        accum_loss = None
         for _ in range(args.grad_accum_steps):
             try:
                 x, y = next(data_iter)
@@ -399,7 +405,8 @@ def main():
                 _, loss = model(x, y)
                 loss = loss / args.grad_accum_steps
             scaler.scale(loss).backward()
-            accum_loss += loss.detach().item()
+            detached = loss.detach()
+            accum_loss = detached if accum_loss is None else accum_loss + detached
 
         for opt in optimizers:
             scaler.unscale_(opt)
@@ -408,17 +415,17 @@ def main():
             scaler.step(opt)
         scaler.update()
 
-        running_loss += accum_loss
+        running_loss = accum_loss if running_loss is None else running_loss + accum_loss
         step += 1
 
         if step % args.log_every == 0:
-            avg_loss = running_loss / args.log_every
+            avg_loss = (running_loss / args.log_every).item()  # single GPU->CPU sync per log
             elapsed = time.time() - t0
             tokens_per_sec = args.log_every * args.batch_size * args.grad_accum_steps * block_size / elapsed
             print(f"step {step:>6} | loss {avg_loss:.4f} | lr {lr:.2e} | {tokens_per_sec:,.0f} tok/s")
             if not args.no_trackio:
                 trackio.log({"loss": avg_loss, "lr": lr, "tokens_per_sec": tokens_per_sec})
-            running_loss = 0.0
+            running_loss = None
             t0 = time.time()
 
         if val_loader is not None and step % args.eval_every == 0:
