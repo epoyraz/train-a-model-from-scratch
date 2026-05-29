@@ -37,6 +37,25 @@ Decoder-only transformer with independently configurable techniques:
 through INT8 tensor cores; such checkpoints can be packed to ~2 bits/weight with
 `export_ternary.py` (8× smaller on disk).
 
+## What each optimization buys you
+
+All measured on an RTX 2060 Super. Each lever acts on a different axis — train speed,
+inference speed, convergence, or memory — so they stack:
+
+| Lever | Train tok/s | Infer tok/s | Loss per step | Train memory |
+|---|---|---|---|---|
+| **`torch.compile`** | **1.4–1.5×** | **~1.8×** (dynamic) | — | — |
+| **Muon** + QK-norm/ReLU²/softcap | ~same | — | **2.30 → 2.13** | — |
+| **Zero-init** projections | — | — | **2.13 → 2.04** | — |
+| **Chunked cross-entropy** | ↑ when memory-bound | — | — | **2.75× less** |
+| **MTP** | slower | — | sample-eff. + spec-decode | more |
+
+Notes: zero-init and chunked-CE are free (no quality change — verified by equivalence
+tests). Muon converges much better per step but is ~slightly slower per step (≈even on the
+modded recipe). Chunked-CE's *speed* win only shows up when you're memory-bound (e.g. large
+batch without `torch.compile`); its **memory** saving is unconditional. MTP's heads are idle
+during plain (non-speculative) decode, so they don't affect inference speed.
+
 ## Training Profiles
 
 Pre-configured profiles optimized for different hardware:
