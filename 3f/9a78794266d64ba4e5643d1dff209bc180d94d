@@ -1,0 +1,29 @@
+model.py
+  s_d55a0a454e2bc6::t_7922225b9a517e 529-530
+  s_d55a0a454e2bc6::t_90ecc9f1ae65cd 301-302,308-318
+  s_d55a0a454e2bc6::t_d48655b9cefae2 15-38
+  s_d55a0a454e2bc6::t_823e0470df80fd 593-608
+train.py
+  s_d55a0a454e2bc6::t_f19702ce800573 71-73,75,80,89-93,107-108,112-113,115-128
+  s_d55a0a454e2bc6::t_946eb1815d0e06 166-167
+  s_d55a0a454e2bc6::t_aa9327db28034f 322-323
+  s_d55a0a454e2bc6::t_9373b95722c0dc 76-78,83-84
+test_equivalence.py
+  s_d55a0a454e2bc6::t_3717332ba14966 1-121
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "3f9a78794266d64ba4e5643d1dff209bc180d94d",
+  "prompts": {},
+  "sessions": {
+    "s_d55a0a454e2bc6": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "299b172e-092d-4066-bdd2-96626d02c786",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "Enes Poyraz <epoyraz.eth@googlemail.com>"
+    }
+  }
+}
