@@ -3,7 +3,7 @@ import torch.nn as nn
 from model import (
     sinkhorn, MHCResidual, MHCExpand, MHCCollapse,
     BitLinear,
-    PolarQuantizer, TurboQuantKVCache,
+    PolarQuantizer, KVCache, TurboQuantKVCache,
     MTPHead,
     RotaryEmbedding, apply_rope, rotate_half,
     SwiGLU,
@@ -149,23 +149,36 @@ def test_polar_quantizer():
 
 
 def test_kv_cache():
-    print("\n=== TurboQuant KV Cache ===")
-    cache = TurboQuantKVCache(bits=4)
+    print("\n=== KV Cache ===")
+    cache = KVCache(max_seq_len=32)
     k1 = torch.randn(1, 8, 16, 64)
     v1 = torch.randn(1, 8, 16, 64)
     cache.update(k1, v1)
 
     k_out, v_out = cache.get()
     check("single update shape", k_out.shape == k1.shape and v_out.shape == v1.shape)
+    check("single update values", torch.allclose(k_out, k1) and torch.allclose(v_out, v1))
 
     k2 = torch.randn(1, 8, 8, 64)
     v2 = torch.randn(1, 8, 8, 64)
     cache.update(k2, v2)
     k_out, v_out = cache.get()
     check("two updates concat", k_out.shape[2] == 24 and v_out.shape[2] == 24)
+    check("second update values", torch.allclose(k_out[:, :, 16:24], k2) and torch.allclose(v_out[:, :, 16:24], v2))
 
     cache.clear()
-    check("clear empties cache", len(cache.k_cache) == 0 and len(cache.v_cache) == 0)
+    check("clear resets position", cache.pos == 0)
+
+    print("\n=== TurboQuant KV Cache ===")
+    tq_cache = TurboQuantKVCache(bits=4)
+    tq_cache.update(k1, v1)
+    k_out, v_out = tq_cache.get()
+    check("turboquant single update shape", k_out.shape == k1.shape and v_out.shape == v1.shape)
+    tq_cache.update(k2, v2)
+    k_out, v_out = tq_cache.get()
+    check("turboquant two updates concat", k_out.shape[2] == 24 and v_out.shape[2] == 24)
+    tq_cache.clear()
+    check("turboquant clear empties cache", len(tq_cache.k_cache) == 0 and len(tq_cache.v_cache) == 0)
 
 
 def test_mtp():
@@ -340,6 +353,68 @@ def test_full_model_generate():
         check(f"{name} prompt preserved", (out[0, :8] == prompt[0]).all().item())
 
 
+def test_top_p_min_p_generate():
+    print("\n=== Top-p/min-p generation ===")
+    cfg = {
+        **BASE_CONFIG,
+        "vocab_size": 256,
+        "block_size": 32,
+        "n_embd": 64,
+        "n_head": 4,
+        "n_layer": 2,
+        "use_rope": True,
+        "n_kv_head": 2,
+        "use_swiglu": True,
+        "use_rmsnorm": True,
+    }
+    model = GPT(cfg).eval()
+    prompt = torch.randint(0, cfg["vocab_size"], (1, 8))
+    with torch.no_grad():
+        out = model.generate(
+            prompt,
+            max_new_tokens=10,
+            temperature=0.8,
+            top_k=0,
+            top_p=0.9,
+            min_p=0.01,
+        )
+    check("top-p/min-p generate length", out.shape == (1, 18))
+    check("top-p/min-p prompt preserved", (out[0, :8] == prompt[0]).all().item())
+
+
+def test_mtp_speculative_generate():
+    print("\n=== MTP speculative generation ===")
+    cfg = {
+        **BASE_CONFIG,
+        "vocab_size": 256,
+        "block_size": 32,
+        "n_embd": 64,
+        "n_head": 4,
+        "n_layer": 2,
+        "use_rope": True,
+        "n_kv_head": 2,
+        "use_swiglu": True,
+        "use_rmsnorm": True,
+        "use_mtp": True,
+        "mtp_heads": 3,
+        "use_turboquant": True,
+        "turboquant_bits": 4,
+    }
+    model = GPT(cfg).eval()
+    prompt = torch.randint(0, cfg["vocab_size"], (1, 8))
+    with torch.no_grad():
+        out = model.generate(
+            prompt,
+            max_new_tokens=10,
+            temperature=0.0,
+            speculative=True,
+            speculate_tokens=3,
+            use_turboquant=True,
+        )
+    check("speculative+turbo generate length", out.shape == (1, 18))
+    check("speculative+turbo prompt preserved", (out[0, :8] == prompt[0]).all().item())
+
+
 if __name__ == "__main__":
     test_sinkhorn()
     test_mhc_residual()
@@ -356,6 +431,8 @@ if __name__ == "__main__":
     test_modern()
     test_full_model_configs()
     test_full_model_generate()
+    test_top_p_min_p_generate()
+    test_mtp_speculative_generate()
 
     print(f"\n{'=' * 40}")
     print(f"Results: {PASS} passed, {FAIL} failed")

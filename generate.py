@@ -1,9 +1,31 @@
+import argparse
+import time
+
 import torch
 from tokenizers import Tokenizer
-from model import GPT, MODEL_CONFIG
-from config import DEVICE, CHECKPOINT_DIR, TOKENIZER_PATH
 
-CHECKPOINT = f"{CHECKPOINT_DIR}/final.pt"
+from config import CHECKPOINT_DIR, DEVICE, TOKENIZER_PATH
+from model import GPT
+
+
+DEFAULT_CHECKPOINT = f"{CHECKPOINT_DIR}/final.pt"
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Generate text from a trained checkpoint.")
+    parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
+    parser.add_argument("--prompt", default=None)
+    parser.add_argument("--max-tokens", type=int, default=200)
+    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--top-k", type=int, default=40)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--min-p", type=float, default=None)
+    parser.add_argument("--speculative", action="store_true")
+    parser.add_argument("--speculate-tokens", type=int, default=None)
+    parser.add_argument("--turboquant", action="store_true")
+    parser.add_argument("--no-turboquant", action="store_true")
+    parser.add_argument("--no-kv-cache", action="store_true")
+    return parser.parse_args()
 
 
 def load_model(checkpoint_path):
@@ -11,39 +33,85 @@ def load_model(checkpoint_path):
     model = GPT(ckpt["config"]).to(DEVICE)
     model.load_state_dict(ckpt["model"])
     model.eval()
-    return model
+    return model, ckpt
 
 
-def generate(model, tokenizer, prompt, max_tokens=200, temperature=0.8, top_k=40):
+def resolve_turboquant(args, config):
+    if args.turboquant:
+        return True
+    if args.no_turboquant:
+        return False
+    return config.get("use_turboquant", False)
+
+
+def generate_text(model, tokenizer, prompt, args, use_turboquant):
     ids = tokenizer.encode(prompt).ids
     idx = torch.tensor([ids], dtype=torch.long, device=DEVICE)
+
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+    started = time.perf_counter()
     with torch.no_grad():
-        out = model.generate(idx, max_new_tokens=max_tokens, temperature=temperature, top_k=top_k)
-    return tokenizer.decode(out[0].tolist())
+        out = model.generate(
+            idx,
+            max_new_tokens=args.max_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            min_p=args.min_p,
+            speculative=args.speculative,
+            speculate_tokens=args.speculate_tokens,
+            use_turboquant=use_turboquant,
+            use_kv_cache=not args.no_kv_cache,
+        )
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - started
+
+    generated_tokens = out.shape[1] - idx.shape[1]
+    tps = generated_tokens / elapsed if elapsed > 0 else float("inf")
+    return tokenizer.decode(out[0].tolist()), generated_tokens, elapsed, tps
+
+
+def print_generation(model, tokenizer, prompt, args, use_turboquant):
+    text, generated_tokens, elapsed, tps = generate_text(model, tokenizer, prompt, args, use_turboquant)
+    print(f"Prompt: {prompt}")
+    print(f"Output: {text}")
+    print(f"Generated: {generated_tokens} tokens in {elapsed:.3f}s ({tps:.2f} tok/s)")
+    print("-" * 60)
 
 
 def main():
+    args = parse_args()
     tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
-    model = load_model(CHECKPOINT)
-    print(f"Loaded {CHECKPOINT} on {DEVICE}\n")
+    model, ckpt = load_model(args.checkpoint)
+    config = ckpt["config"]
+    use_turboquant = resolve_turboquant(args, config)
+
+    if args.speculative and not config.get("use_mtp", False):
+        print("Speculative mode requested, but this checkpoint has no MTP heads. Falling back to normal generation.")
+    print(f"Loaded {args.checkpoint} on {DEVICE}")
+    print(f"Config: {config}")
+    print(f"Mode: speculative={args.speculative and config.get('use_mtp', False)}, kv_cache={not args.no_kv_cache}, turboquant={use_turboquant}\n")
+
+    if args.prompt is not None:
+        print_generation(model, tokenizer, args.prompt, args, use_turboquant)
+        return
 
     prompts = [
         "Once upon a time,",
         "The little dog was",
         "One day, a girl named Lily",
     ]
-
     for prompt in prompts:
-        print(f"Prompt: {prompt}")
-        print(f"Output: {generate(model, tokenizer, prompt)}")
-        print("-" * 60)
+        print_generation(model, tokenizer, prompt, args, use_turboquant)
 
     print("\nInteractive mode (type 'quit' to exit):")
     while True:
         prompt = input("\n> ")
         if prompt.lower() == "quit":
             break
-        print(generate(model, tokenizer, prompt))
+        print_generation(model, tokenizer, prompt, args, use_turboquant)
 
 
 if __name__ == "__main__":

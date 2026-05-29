@@ -5,10 +5,9 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_from_disk
 from tokenizers import Tokenizer
-from model import GPT, MODEL_CONFIG
+from model import GPT
 from config import DEVICE, DTYPE, DATA_DIR, TOKENIZER_PATH, CHECKPOINT_DIR, VAL_TOKENS_CACHE
 
-BLOCK_SIZE = MODEL_CONFIG["block_size"]
 BATCH_SIZE = 64
 
 
@@ -27,7 +26,7 @@ class TokenDataset(Dataset):
         return x, y
 
 
-def tokenize_validation():
+def tokenize_validation(block_size):
     if os.path.exists(VAL_TOKENS_CACHE):
         return np.load(VAL_TOKENS_CACHE)
 
@@ -42,7 +41,7 @@ def tokenize_validation():
         all_ids.append(eos_id)
 
     all_ids = np.array(all_ids, dtype=np.uint16)
-    all_ids = all_ids[:((len(all_ids) - 1) // BLOCK_SIZE) * BLOCK_SIZE + 1]
+    all_ids = all_ids[:((len(all_ids) - 1) // block_size) * block_size + 1]
     np.save(VAL_TOKENS_CACHE, all_ids)
     return all_ids
 
@@ -67,15 +66,17 @@ def eval_checkpoint(path, loader):
 
 
 def main():
-    tokens = tokenize_validation()
-    dataset = TokenDataset(tokens, BLOCK_SIZE)
-    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
-    print(f"Validation: {len(tokens):,} tokens, {len(dataset)} chunks\n")
-
     checkpoints = sorted(glob.glob(f"{CHECKPOINT_DIR}/step_*.pt")) + glob.glob(f"{CHECKPOINT_DIR}/final.pt")
     if not checkpoints:
         print(f"No checkpoints found in {CHECKPOINT_DIR}/")
         return
+
+    first_ckpt = torch.load(checkpoints[0], map_location="cpu", weights_only=True)
+    block_size = first_ckpt["config"]["block_size"]
+    tokens = tokenize_validation(block_size)
+    dataset = TokenDataset(tokens, block_size)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)
+    print(f"Validation: {len(tokens):,} tokens, {len(dataset)} chunks, block_size={block_size}\n")
 
     print(f"{'Checkpoint':<30} {'Val Loss':>10} {'Perplexity':>12}")
     print("-" * 55)

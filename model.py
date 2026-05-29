@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from torch.utils.checkpoint import checkpoint
 
 
 # --- mHC: Manifold-Constrained Hyper-Connections ---
@@ -70,12 +71,12 @@ class BitLinear(nn.Module):
         w_ternary = torch.zeros_like(w)
         w_ternary[w > threshold] = alpha
         w_ternary[w < -threshold] = -alpha
-        return w + (w_ternary - w).detach()
+        return w_ternary.detach() + (w - w.detach())
 
     def activation_quantize(self, x):
         scale = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-5)
         x_scaled = x * scale
-        x_q = x_scaled + (x_scaled.round().clamp(-128, 127) - x_scaled).detach()
+        x_q = x_scaled.round().clamp(-128, 127).detach() + (x_scaled - x_scaled.detach())
         return x_q / scale
 
     def forward(self, x):
@@ -116,6 +117,7 @@ class PolarQuantizer:
         norm_min, norm_scale, val_min, val_scale = params
         norms = q_norms * norm_scale + norm_min
         unit = q_unit * val_scale + val_min
+        unit = unit / unit.norm(dim=-1, keepdim=True).clamp(min=1e-8)
         return unit * norms
 
 
@@ -139,6 +141,54 @@ class TurboQuantKVCache:
     def clear(self):
         self.k_cache.clear()
         self.v_cache.clear()
+
+
+class KVCache:
+    def __init__(self, max_seq_len):
+        self.max_seq_len = max_seq_len
+        self.k_cache = None
+        self.v_cache = None
+        self.pos = 0
+
+    def _ensure_allocated(self, k_new, v_new):
+        B, H, _, D = k_new.shape
+        needs_alloc = (
+            self.k_cache is None
+            or self.k_cache.shape[0] != B
+            or self.k_cache.shape[1] != H
+            or self.k_cache.shape[3] != D
+            or self.k_cache.device != k_new.device
+            or self.k_cache.dtype != k_new.dtype
+        )
+        if needs_alloc:
+            self.k_cache = torch.empty(
+                B, H, self.max_seq_len, D,
+                device=k_new.device,
+                dtype=k_new.dtype,
+            )
+            self.v_cache = torch.empty(
+                B, H, self.max_seq_len, D,
+                device=v_new.device,
+                dtype=v_new.dtype,
+            )
+            self.pos = 0
+
+    def update(self, k_new, v_new):
+        self._ensure_allocated(k_new, v_new)
+        T = k_new.size(2)
+        if self.pos + T > self.max_seq_len:
+            raise ValueError(f"KV cache length {self.pos + T} exceeds max_seq_len {self.max_seq_len}")
+        self.k_cache[:, :, self.pos:self.pos + T, :].copy_(k_new)
+        self.v_cache[:, :, self.pos:self.pos + T, :].copy_(v_new)
+        self.pos += T
+
+    def get(self):
+        if self.k_cache is None:
+            return None, None
+        return self.k_cache[:, :, :self.pos, :], self.v_cache[:, :, :self.pos, :]
+
+    def clear(self):
+        self.pos = 0
 
 
 # --- MTP: Multi-Token Prediction ---
@@ -330,6 +380,7 @@ class GPT(nn.Module):
         self.mtp_weight = config.get("mtp_weight", 0.1)
         self.use_turboquant = config.get("use_turboquant", False)
         self.turboquant_bits = config.get("turboquant_bits", 4)
+        self.use_activation_checkpointing = config.get("use_activation_checkpointing", False)
         use_rmsnorm = config.get("use_rmsnorm", False)
 
         self.tok_emb = nn.Embedding(config["vocab_size"], config["n_embd"])
@@ -349,6 +400,9 @@ class GPT(nn.Module):
             self.mtp_heads = nn.ModuleList([
                 MTPHead(config, future_idx=i + 1) for i in range(self.mtp_heads_n)
             ])
+            if config.get("tie_mtp_lm_head", True):
+                for head in self.mtp_heads:
+                    head.lm_head.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
 
@@ -360,7 +414,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def _compute_hidden(self, idx):
         B, T = idx.shape
         if T > self.config["block_size"]:
             raise ValueError(f"Input length {T} exceeds block_size {self.config['block_size']}")
@@ -372,13 +426,22 @@ class GPT(nn.Module):
         if self.use_mhc:
             streams = self.mhc_expand(x)
             for block in self.blocks:
-                streams = block(x, streams=streams)
+                if self.training and self.use_activation_checkpointing:
+                    streams = checkpoint(lambda s, b=block: b(x, streams=s), streams, use_reentrant=False)
+                else:
+                    streams = block(x, streams=streams)
             x = self.mhc_collapse(streams)
         else:
             for block in self.blocks:
-                x = block(x)
+                if self.training and self.use_activation_checkpointing:
+                    x = checkpoint(block, x, use_reentrant=False)
+                else:
+                    x = block(x)
 
-        hidden = self.ln_f(x)
+        return self.ln_f(x)
+
+    def forward(self, idx, targets=None, return_hidden=False):
+        hidden = self._compute_hidden(idx)
         logits = self.lm_head(hidden)
         loss = None
         if targets is not None:
@@ -388,9 +451,11 @@ class GPT(nn.Module):
                     _, mtp_loss = head(hidden, targets)
                     if mtp_loss is not None:
                         loss = loss + self.mtp_weight * mtp_loss
+        if return_hidden:
+            return logits, loss, hidden
         return logits, loss
 
-    def _forward_inference(self, x, kv_caches, pos_offset=0):
+    def _forward_inference(self, x, kv_caches, pos_offset=0, return_hidden=False):
         if self.use_mhc:
             streams = self.mhc_expand(x)
             for block, cache in zip(self.blocks, kv_caches or [None] * len(self.blocks)):
@@ -399,7 +464,11 @@ class GPT(nn.Module):
         else:
             for block, cache in zip(self.blocks, kv_caches or [None] * len(self.blocks)):
                 x = block(x, kv_cache=cache, pos_offset=pos_offset)
-        return self.lm_head(self.ln_f(x))
+        hidden = self.ln_f(x)
+        logits = self.lm_head(hidden)
+        if return_hidden:
+            return logits, hidden
+        return logits
 
     def _embed(self, tokens, pos_offset=0):
         x = self.tok_emb(tokens)
@@ -409,61 +478,284 @@ class GPT(nn.Module):
             x = x + self.pos_emb(pos)
         return x
 
-    def generate(self, idx, max_new_tokens, temperature=0.8, top_k=40):
+    def _filter_logits(self, logits, top_k=None, top_p=None, min_p=None):
+        if top_k is not None and top_k > 0:
+            k = min(top_k, logits.size(-1))
+            values, _ = torch.topk(logits, k)
+            logits = logits.masked_fill(logits < values[:, [-1]], -float("inf"))
+
+        if min_p is not None and min_p > 0:
+            probs = F.softmax(logits, dim=-1)
+            max_probs = probs.max(dim=-1, keepdim=True).values
+            remove = probs < (min_p * max_probs)
+            top_token = logits.argmax(dim=-1, keepdim=True)
+            remove.scatter_(dim=-1, index=top_token, value=False)
+            logits = logits.masked_fill(remove, -float("inf"))
+
+        if top_p is not None and 0 < top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+            sorted_probs = F.softmax(sorted_logits, dim=-1)
+            cumulative_probs = sorted_probs.cumsum(dim=-1)
+            sorted_remove = cumulative_probs > top_p
+            sorted_remove[..., 1:] = sorted_remove[..., :-1].clone()
+            sorted_remove[..., 0] = False
+            remove = torch.zeros_like(logits, dtype=torch.bool)
+            remove.scatter_(dim=-1, index=sorted_idx, src=sorted_remove)
+            logits = logits.masked_fill(remove, -float("inf"))
+
+        return logits
+
+    def _distribution(self, logits, temperature=0.8, top_k=40, top_p=None, min_p=None):
+        if temperature <= 0:
+            token = logits.argmax(dim=-1, keepdim=True)
+            probs = torch.zeros_like(logits)
+            probs.scatter_(1, token, 1.0)
+            return token, probs
+        logits = self._filter_logits(logits / temperature, top_k=top_k, top_p=top_p, min_p=min_p)
+        probs = F.softmax(logits, dim=-1)
+        token = torch.multinomial(probs, num_samples=1)
+        return token, probs
+
+    def _make_kv_caches(self, use_turboquant, use_kv_cache=True):
+        if not use_kv_cache:
+            return None
+        if use_turboquant:
+            return [TurboQuantKVCache(bits=self.turboquant_bits) for _ in self.blocks]
+        return [KVCache(self.config["block_size"]) for _ in self.blocks]
+
+    def _trim_or_seed_prompt(self, idx):
         block_size = self.config["block_size"]
         if idx.shape[1] == 0:
             eos_id = 1
             idx = torch.tensor([[eos_id]], dtype=idx.dtype, device=idx.device)
-        idx = idx[:, -block_size:]
-        has_cache = self.use_turboquant
-        kv_caches = None
-        if has_cache:
-            kv_caches = [TurboQuantKVCache(bits=self.turboquant_bits) for _ in self.blocks]
+        return idx[:, -block_size:]
 
+    def _prefill_generation(self, idx, use_turboquant=False, use_kv_cache=True):
+        kv_caches = self._make_kv_caches(use_turboquant, use_kv_cache=use_kv_cache)
         seq_len = idx.shape[1]
         x = self._embed(idx)
-        logits = self._forward_inference(x, kv_caches, pos_offset=0)
+        logits, hidden = self._forward_inference(x, kv_caches, pos_offset=0, return_hidden=True)
+        return logits, hidden[:, -1:, :], kv_caches, seq_len
+
+    def _advance_generation_state(self, idx, idx_next, kv_caches, seq_len, use_turboquant):
+        block_size = self.config["block_size"]
+        if kv_caches is not None and seq_len < block_size:
+            x = self._embed(idx_next, pos_offset=seq_len)
+            logits, hidden = self._forward_inference(x, kv_caches, pos_offset=seq_len, return_hidden=True)
+            return logits, hidden[:, -1:, :], kv_caches, seq_len + 1
+
+        use_kv_cache = kv_caches is not None
+        if kv_caches:
+            for cache in kv_caches:
+                cache.clear()
+        idx_cond = idx[:, -block_size:]
+        logits, hidden, kv_caches, seq_len = self._prefill_generation(
+            idx_cond,
+            use_turboquant=use_turboquant,
+            use_kv_cache=use_kv_cache,
+        )
+        return logits, hidden, kv_caches, seq_len
+
+    def _generate_autoregressive(
+        self,
+        idx,
+        max_new_tokens,
+        temperature=0.8,
+        top_k=40,
+        top_p=None,
+        min_p=None,
+        use_turboquant=None,
+        use_kv_cache=True,
+    ):
+        idx = self._trim_or_seed_prompt(idx)
+        use_turboquant = self.use_turboquant if use_turboquant is None else use_turboquant
+        logits, last_hidden, kv_caches, seq_len = self._prefill_generation(
+            idx,
+            use_turboquant=use_turboquant,
+            use_kv_cache=use_kv_cache,
+        )
 
         for i in range(max_new_tokens):
-            if temperature <= 0:
-                idx_next = logits[:, -1, :].argmax(dim=-1, keepdim=True)
-                idx = torch.cat([idx, idx_next], dim=1)
-                if i < max_new_tokens - 1:
-                    cur_pos = seq_len + i
-                    if has_cache and cur_pos < block_size:
-                        x = self._embed(idx_next, pos_offset=cur_pos)
-                        logits = self._forward_inference(x, kv_caches, pos_offset=cur_pos)
-                    else:
-                        if kv_caches:
-                            for c in kv_caches:
-                                c.clear()
-                        idx_cond = idx[:, -block_size:]
-                        x = self._embed(idx_cond)
-                        logits = self._forward_inference(x, kv_caches, pos_offset=0)
-                continue
-            logits_last = logits[:, -1, :] / temperature
-            if top_k is not None and top_k > 0:
-                k = min(top_k, logits_last.size(-1))
-                v, _ = torch.topk(logits_last, k)
-                logits_last[logits_last < v[:, [-1]]] = -float("inf")
-            probs = F.softmax(logits_last, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
+            idx_next, _ = self._distribution(
+                logits[:, -1, :],
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+            )
             idx = torch.cat([idx, idx_next], dim=1)
 
             if i < max_new_tokens - 1:
-                cur_pos = seq_len + i
-                if has_cache and cur_pos < block_size:
-                    x = self._embed(idx_next, pos_offset=cur_pos)
-                    logits = self._forward_inference(x, kv_caches, pos_offset=cur_pos)
-                else:
-                    if kv_caches:
-                        for c in kv_caches:
-                            c.clear()
-                    idx_cond = idx[:, -block_size:]
-                    x = self._embed(idx_cond)
-                    logits = self._forward_inference(x, kv_caches, pos_offset=0)
+                logits, last_hidden, kv_caches, seq_len = self._advance_generation_state(
+                    idx, idx_next, kv_caches, seq_len, use_turboquant
+                )
 
         return idx
+
+    def _mtp_draft(self, last_hidden, n_tokens, temperature=0.8, top_k=40, top_p=None, min_p=None):
+        draft_tokens = []
+        draft_probs = []
+        for head in self.mtp_heads[:n_tokens]:
+            draft_logits, _ = head(last_hidden)
+            token, probs = self._distribution(
+                draft_logits[:, -1, :],
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+            )
+            draft_tokens.append(token)
+            draft_probs.append(probs)
+        return draft_tokens, draft_probs
+
+    def _mtp_speculative_generate(
+        self,
+        idx,
+        max_new_tokens,
+        temperature=0.8,
+        top_k=40,
+        top_p=None,
+        min_p=None,
+        speculate_tokens=None,
+        use_turboquant=None,
+        use_kv_cache=True,
+    ):
+        if not self.use_mtp or idx.size(0) != 1:
+            return self._generate_autoregressive(
+                idx,
+                max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                use_turboquant=use_turboquant,
+                use_kv_cache=use_kv_cache,
+            )
+
+        idx = self._trim_or_seed_prompt(idx)
+        use_turboquant = self.use_turboquant if use_turboquant is None else use_turboquant
+        draft_width = speculate_tokens or self.mtp_heads_n
+        draft_width = max(1, min(draft_width, self.mtp_heads_n))
+
+        logits, last_hidden, kv_caches, seq_len = self._prefill_generation(
+            idx,
+            use_turboquant=use_turboquant,
+            use_kv_cache=use_kv_cache,
+        )
+        generated = 0
+
+        while generated < max_new_tokens:
+            remaining = max_new_tokens - generated
+            n_draft = min(draft_width, remaining)
+            draft_tokens, draft_probs = self._mtp_draft(
+                last_hidden,
+                n_draft,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+            )
+            accepted_all = True
+
+            for draft_token, q_probs in zip(draft_tokens, draft_probs):
+                target_token, p_probs = self._distribution(
+                    logits[:, -1, :],
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    min_p=min_p,
+                )
+
+                if temperature <= 0:
+                    accept = torch.equal(draft_token, target_token)
+                else:
+                    proposed = draft_token.item()
+                    p = p_probs[0, proposed]
+                    q = q_probs[0, proposed].clamp(min=1e-12)
+                    accept_prob = torch.minimum(torch.ones_like(p), p / q)
+                    accept = torch.rand((), device=idx.device) <= accept_prob
+
+                if accept:
+                    idx_next = draft_token
+                else:
+                    accepted_all = False
+                    if temperature <= 0:
+                        idx_next = target_token
+                    else:
+                        residual = (p_probs - q_probs).clamp(min=0)
+                        denom = residual.sum(dim=-1, keepdim=True)
+                        if denom.item() <= 1e-12:
+                            idx_next = target_token
+                        else:
+                            idx_next = torch.multinomial(residual / denom, num_samples=1)
+
+                idx = torch.cat([idx, idx_next], dim=1)
+                generated += 1
+                if generated >= max_new_tokens:
+                    break
+
+                logits, last_hidden, kv_caches, seq_len = self._advance_generation_state(
+                    idx, idx_next, kv_caches, seq_len, use_turboquant
+                )
+
+                if not accepted_all:
+                    break
+
+            if generated >= max_new_tokens:
+                break
+
+            if accepted_all:
+                idx_next, _ = self._distribution(
+                    logits[:, -1, :],
+                    temperature=temperature,
+                    top_k=top_k,
+                    top_p=top_p,
+                    min_p=min_p,
+                )
+                idx = torch.cat([idx, idx_next], dim=1)
+                generated += 1
+                if generated < max_new_tokens:
+                    logits, last_hidden, kv_caches, seq_len = self._advance_generation_state(
+                        idx, idx_next, kv_caches, seq_len, use_turboquant
+                    )
+
+        return idx
+
+    def generate(
+        self,
+        idx,
+        max_new_tokens,
+        temperature=0.8,
+        top_k=40,
+        top_p=None,
+        min_p=None,
+        speculative=False,
+        speculate_tokens=None,
+        use_turboquant=None,
+        use_kv_cache=True,
+    ):
+        if speculative:
+            return self._mtp_speculative_generate(
+                idx,
+                max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                speculate_tokens=speculate_tokens,
+                use_turboquant=use_turboquant,
+                use_kv_cache=use_kv_cache,
+            )
+        return self._generate_autoregressive(
+            idx,
+            max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            min_p=min_p,
+            use_turboquant=use_turboquant,
+            use_kv_cache=use_kv_cache,
+        )
 
 
 # --- Configs ---
@@ -511,21 +803,83 @@ RECOMMENDED_CONFIG = {
     "use_mtp": True, "mtp_heads": 4, "mtp_weight": 0.1,
 }
 
+FAST_2060_CONFIG = {
+    **BASE_CONFIG,
+    "block_size": 256,
+    "n_embd": 384,
+    "n_head": 6,
+    "n_layer": 8,
+    "use_rope": True,
+    "n_kv_head": 2,
+    "use_swiglu": True,
+    "use_rmsnorm": True,
+}
+
+FAST_2060_MTP_CONFIG = {
+    **FAST_2060_CONFIG,
+    "use_mtp": True,
+    "mtp_heads": 2,
+    "mtp_weight": 0.1,
+    "tie_mtp_lm_head": True,
+}
+
+FAST_2060_MTP_TURBO_CONFIG = {
+    **FAST_2060_MTP_CONFIG,
+    "use_turboquant": True,
+    "turboquant_bits": 4,
+}
+
+TINY_FAST_CONFIG = {
+    **BASE_CONFIG,
+    "block_size": 256,
+    "n_embd": 256,
+    "n_head": 4,
+    "n_layer": 6,
+    "use_rope": True,
+    "n_kv_head": 2,
+    "use_swiglu": True,
+    "use_rmsnorm": True,
+}
+
+LOW_MEMORY_2060_CONFIG = {
+    **FAST_2060_CONFIG,
+    "use_activation_checkpointing": True,
+}
+
+CONFIGS = {
+    "base": BASE_CONFIG,
+    "mhc": MHC_CONFIG,
+    "bitnet": BITNET_CONFIG,
+    "mtp": MTP_CONFIG,
+    "rope": ROPE_CONFIG,
+    "gqa": GQA_CONFIG,
+    "swiglu": SWIGLU_CONFIG,
+    "rmsnorm": RMSNORM_CONFIG,
+    "turboquant": TURBOQUANT_CONFIG,
+    "mhc_bitnet": MHC_BITNET_CONFIG,
+    "mhc_mtp": MHC_MTP_CONFIG,
+    "modern": MODERN_CONFIG,
+    "all": ALL_CONFIG,
+    "recommended": RECOMMENDED_CONFIG,
+    "fast_2060": FAST_2060_CONFIG,
+    "fast_2060_mtp": FAST_2060_MTP_CONFIG,
+    "fast_2060_mtp_turbo": FAST_2060_MTP_TURBO_CONFIG,
+    "tiny_fast": TINY_FAST_CONFIG,
+    "low_memory_2060": LOW_MEMORY_2060_CONFIG,
+}
+
+
+def get_model_config(name="fast_2060", **overrides):
+    if name not in CONFIGS:
+        available = ", ".join(sorted(CONFIGS))
+        raise ValueError(f"Unknown config '{name}'. Available configs: {available}")
+    return {**CONFIGS[name], **{k: v for k, v in overrides.items() if v is not None}}
+
+
 MODEL_CONFIG = RECOMMENDED_CONFIG
 
 if __name__ == "__main__":
-    configs = {
-        "base": BASE_CONFIG,
-        "rope": ROPE_CONFIG,
-        "gqa": GQA_CONFIG,
-        "swiglu": SWIGLU_CONFIG,
-        "rmsnorm": RMSNORM_CONFIG,
-        "modern": MODERN_CONFIG,
-        "mhc": MHC_CONFIG,
-        "bitnet": BITNET_CONFIG,
-        "mtp": MTP_CONFIG,
-        "all": ALL_CONFIG,
-    }
+    configs = CONFIGS
     for name, cfg in configs.items():
         model = GPT(cfg)
         n_params = sum(p.numel() for p in model.parameters())
